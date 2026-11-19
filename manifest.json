@@ -2,8 +2,8 @@
   "manifest_version": "0.4",
   "name": "orcamcp",
   "display_name": "Orca MCP",
-  "version": "1.1.0",
-  "description": "Slice with your own OrcaSlicer and user presets, on any of your printers: grams, print time, G-code, batch slicing and printer comparison.",
+  "version": "1.2.0",
+  "description": "Slice with your own OrcaSlicer presets and printers, guided: it asks printer, filament, process and orientation, then advises (supports, orientation, profile) with measured alternatives.",
   "long_description": "Uses the OrcaSlicer CLI with your own user presets (including presets that inherit from system ones, which the CLI cannot resolve on its own in OrcaSlicer 2.5). Works on a private copy of your presets; never writes to your OrcaSlicer folder and never overwrites files.",
   "author": {
     "name": "Ricardo Lugaresi",
@@ -30,6 +30,10 @@
   },
   "tools": [
     {
+      "name": "slicing_guide",
+      "description": "How to run a guided slicing session"
+    },
+    {
       "name": "list_printers",
       "description": "Your printers, nozzles and which one is active"
     },
@@ -39,7 +43,15 @@
     },
     {
       "name": "list_profiles",
-      "description": "Your printer, process and filament presets (optionally only those compatible with a printer)"
+      "description": "Your presets, optionally only those compatible with a printer"
+    },
+    {
+      "name": "analyze_model",
+      "description": "Orientation analysis: real overhangs, bridges, bed contact, height"
+    },
+    {
+      "name": "slice_advice",
+      "description": "Slice and measure alternatives (no supports, rotated, Orca orientation) with advice"
     },
     {
       "name": "model_info",
@@ -47,7 +59,7 @@
     },
     {
       "name": "slice",
-      "description": "Slice models with your presets: grams, time, optional G-code/3MF"
+      "description": "Slice with your presets: rotation, supports on/off, G-code/3MF"
     },
     {
       "name": "slice_folder",

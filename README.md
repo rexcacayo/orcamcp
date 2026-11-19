@@ -15,15 +15,35 @@ An MCP server that lets Claude (or any MCP client) slice with **your own OrcaSli
 - **Safe.** It never writes to your OrcaSlicer folder and never overwrites files. Saved outputs get `_2`, `_3`… suffixes.
 - **Built for production.** It can slice whole folders into a CSV, and it can clone a part N times to get per-copy figures.
 
+## Guided slicing
+
+When you ask to slice something without giving details, Claude asks one question at a time, always offering **only your own presets**:
+
+1. **Printer.** Your printers, with the active one marked.
+2. **Filament.** Only the filaments compatible with that printer. The material changes the advice: PETG and TPU tolerate overhangs worse than PLA, and ASA/ABS need a large flat base to avoid warping.
+3. **Process.** Only your processes for that printer. One is recommended by part size: finer layers for small, detailed parts and thicker layers for big ones.
+4. **Orientation.** "As is", the orientation with the least support, the most stable one, or "let OrcaSlicer orient it".
+
+Then `slice_advice` slices your choice and **measures the alternatives** before advising. For example:
+
+> *Without supports you save 29 g and 122 min. The overhangs are many small ones, none wider than 9.5 mm: in PLA these usually print acceptably without supports. Worth trying without supports, or with supports on the build plate only.*
+
+The overhang analysis ignores tiny or shallow lips, such as stone undersides or surface texture, and counts flat undersides separately, because they print as bridges.
+
+In **quick mode** ("just slice it", or batch jobs), Claude uses the active printer and its defaults and only gives advice when it is notable.
+
 ## Tools
 
 | Tool | What it does |
 |---|---|
+| `slicing_guide` | Explains the guided flow above, so the client asks the right questions. |
+| `analyze_model` | Analyzes an STL in 6 orientations: real overhang (sloped, and flat ceilings or bridges), largest overhang, bed contact and height. Returns the orientation with the least support and the most stable one, with the `rotate_x`/`rotate_y` to use. |
+| `slice_advice` | Slices your choice and the alternatives worth trying (without supports, least-support orientation, OrcaSlicer's orientation), then gives advice that takes the material and your own processes into account. |
 | `list_printers` | Lists your printers (user printer presets) with nozzle, base model, default presets, how many presets fit each one, and which one is **active**. |
 | `set_printer` | Sets the active printer by name or part of it, e.g. `"kobra"` or `"0.6"`. It is remembered until you change it; `"auto"` goes back to the default. |
 | `list_profiles` | Lists your printer, process and filament presets. With `printer`, it lists only the ones compatible with that printer. |
 | `model_info` | Gives size, volume, facet count and whether the mesh is closed, without slicing. |
-| `slice` | Slices one or more files on one plate and returns grams, time and the presets used. Options: `printer` (for this slice only), `process`, `filament`, `copies`, `auto_orient`, and `save_to` to keep the `.gcode` and `.gcode.3mf`. |
+| `slice` | Slices one or more files on one plate and returns grams, time and the presets used. Options: `printer` (for this slice only), `process`, `filament`, `copies`, `auto_orient`, `rotate_x`/`rotate_y`/`rotate_z`, `supports` (`profile`, `off` or `on`, for this slice only; your presets are never changed), and `save_to` to keep the `.gcode` and `.gcode.3mf`. |
 | `slice_folder` | Slices every model in a folder separately and writes `_orca_slicing.csv`. |
 | `compare_printers` | Slices the same model on several (or all) printers and reports grams and time for each, plus which is fastest and which uses least material. |
 

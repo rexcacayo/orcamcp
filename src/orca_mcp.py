@@ -31,7 +31,7 @@ import tempfile
 
 from mcp.server.fastmcp import FastMCP
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 KINDS = ("machine", "process", "filament")
 
 
@@ -299,6 +299,20 @@ def _read_gcode(path):
                 for n, u in re.findall(r"(\d+)\s*([dhms])", line.split("=", 1)[1]):
                     h += int(n) * {"d": 24, "h": 1, "m": 1 / 60, "s": 1 / 3600}[u]
                 d["hours"] = h
+            elif line.startswith("; enable_support ="):
+                d["supports"] = line.split("=", 1)[1].strip() == "1"
+            elif line.startswith("; support_type ="):
+                d["support_type"] = line.split("=", 1)[1].strip()
+            elif line.startswith("; layer_height ="):
+                try:
+                    d["layer_height"] = float(line.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif line.startswith("; max_z_height:"):
+                try:
+                    d["height_mm"] = float(line.split(":", 1)[1])
+                except ValueError:
+                    pass
             elif line.startswith("; filament_type ="):
                 d["material"] = line.split("=", 1)[1].strip().split(";")[0].strip('" ')
             elif line.startswith("; total filament cost") or line.startswith("; filament cost"):
@@ -330,8 +344,26 @@ def _hm(h):
     return f"{m // 60} h {m % 60:02d} min"
 
 
+SUPPORT_TAG = {"off": " [orcamcp no supports]", "on": " [orcamcp supports]"}
+
+
+def _process_variant(wd, name, supports):
+    """Copy of a user process with supports forced on/off, inside the private data dir only."""
+    if supports not in SUPPORT_TAG:
+        return name
+    src = _preset_file(wd, "process", name)
+    d = _load(src)
+    new = name + SUPPORT_TAG[supports]
+    d["name"] = new
+    d["print_settings_id"] = new
+    d["enable_support"] = "0" if supports == "off" else "1"
+    with open(os.path.join(os.path.dirname(src), new + ".json"), "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    return new
+
+
 def slice_files(files, printer=None, process=None, filament=None, save_to=None, name=None,
-                copies=1, auto_orient=False):
+                copies=1, auto_orient=False, rotate_x=0, rotate_y=0, rotate_z=0, supports="profile"):
     if isinstance(files, str):
         files = [files]
     for f in files:
@@ -339,14 +371,21 @@ def slice_files(files, printer=None, process=None, filament=None, save_to=None, 
             raise ValueError(f"File not found: {f}")
     m, p, fil = choose(printer, process, filament)
     wd = sync()
+    pv = _process_variant(wd, p, (supports or "profile").lower())
     tmp = tempfile.mkdtemp(prefix="orcamcp_")
     try:
         cmd = orca_exe() + [
             "--datadir", wd, "--slice", "0", "--arrange", "1", "--orient", "1" if auto_orient else "0",
-            "--load-settings", _preset_file(wd, "machine", m) + ";" + _preset_file(wd, "process", p),
+            "--load-settings", _preset_file(wd, "machine", m) + ";" + _preset_file(wd, "process", pv),
             "--load-filaments", _preset_file(wd, "filament", fil), "--outputdir", tmp]
         if copies and int(copies) > 1:
             cmd += ["--clone-objects", ",".join([str(int(copies))] * len(files))]
+        if rotate_x:
+            cmd += ["--rotate-x", str(float(rotate_x))]
+        if rotate_y:
+            cmd += ["--rotate-y", str(float(rotate_y))]
+        if rotate_z:
+            cmd += ["--rotate", str(float(rotate_z))]
         if save_to:
             cmd += ["--export-3mf", "project.3mf"]
         cmd += list(files)
@@ -366,7 +405,13 @@ def slice_files(files, printer=None, process=None, filament=None, save_to=None, 
         h = sum(x.get("hours", 0) for x in plates)
         res = {"grams": round(g, 1), "hours": round(h, 2), "time": _hm(h),
                "material": plates[0].get("material", ""), "plates": len(plates),
-               "printer": m, "process": p, "filament": fil}
+               "printer": m, "process": p, "filament": fil,
+               "supports": plates[0].get("supports"), "layer_height": plates[0].get("layer_height"),
+               "height_mm": plates[0].get("height_mm")}
+        if supports in SUPPORT_TAG:
+            res["supports_forced"] = supports
+        if rotate_x or rotate_y or rotate_z:
+            res["rotation"] = {"x": rotate_x, "y": rotate_y, "z": rotate_z}
         if any("cost" in x for x in plates):
             res["orca_filament_cost"] = round(sum(x.get("cost", 0) for x in plates), 2)
         if copies and int(copies) > 1:
@@ -410,11 +455,190 @@ def model_info(path):
     return out or {"raw": r.stdout[-800:]}
 
 
+# ------------------------------------------------------------------ geometry & advice
+import struct
+
+ORIENTATIONS = [  # (label, rotate_x, rotate_y)
+    ("as is", 0, 0), ("x +90", 90, 0), ("x 180 (upside down)", 180, 0), ("x -90", 270, 0),
+    ("y +90", 0, 90), ("y -90", 0, 270)]
+
+# support threshold (degrees from horizontal) used when the process does not say
+MATERIAL = {
+    "PLA": {"overhang": 35, "notes": []},
+    "PETG": {"overhang": 40, "notes": ["PETG sags more on overhangs and bridges than PLA: keep supports on steep overhangs.",
+                                       "PETG sticks hard to supports: use a support/object Z gap of 0.2 mm or more."]},
+    "ASA": {"overhang": 40, "notes": ["ASA warps: prefer the orientation with the largest flat contact on the bed, use a brim and an enclosed printer.",
+                                      "Avoid tall thin orientations with ASA (layer splitting from drafts)."]},
+    "ABS": {"overhang": 40, "notes": ["ABS warps: prefer the largest flat contact on the bed, use a brim and an enclosed printer."]},
+    "TPU": {"overhang": 45, "notes": ["Flexible filament: supports are hard to remove, choose an orientation that avoids them."]},
+}
+
+
+def _material_of(name, gcode_type=""):
+    t = (gcode_type or name or "").upper()
+    for k in ("PETG", "ASA", "ABS", "TPU", "PLA"):
+        if k in t:
+            return k
+    if "FLEX" in t:
+        return "TPU"
+    return gcode_type.upper() if gcode_type else "PLA"
+
+
+def _read_stl(path):
+    import numpy as np
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) >= 84:
+        n = struct.unpack("<I", data[80:84])[0]
+        if 84 + n * 50 == len(data):
+            rec = np.frombuffer(data[84:84 + n * 50], dtype=np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")]))
+            return rec["v"].astype(float)
+    txt = data.decode("utf-8", "ignore")
+    v = [list(map(float, x)) for x in re.findall(r"vertex\s+(\S+)\s+(\S+)\s+(\S+)", txt)]
+    if not v or len(v) % 3:
+        raise ValueError("Orientation analysis needs an STL file.")
+    return np.array(v, dtype=float).reshape(-1, 3, 3)
+
+
+def _rot(rx, ry):
+    import numpy as np
+    a, b = np.radians(rx), np.radians(ry)
+    Rx = np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+    Ry = np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]])
+    return Ry @ Rx
+
+
+def _regions(tri, mask):
+    """Group the masked faces into connected regions (shared vertices). Returns list of index arrays."""
+    import numpy as np
+    idx = np.nonzero(mask)[0]
+    if not len(idx):
+        return []
+    v = np.round(tri[idx].reshape(-1, 3), 3)
+    _, vid = np.unique(v, axis=0, return_inverse=True)
+    vid = vid.reshape(-1, 3)
+    parent = list(range(vid.max() + 1))
+
+    def root(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    for a, b, c in vid:
+        ra, rb, rc = root(a), root(b), root(c)
+        parent[rb] = ra
+        parent[rc] = ra
+    lab = np.array([root(a) for a in vid[:, 0]])
+    return [idx[lab == u] for u in np.unique(lab)]
+
+
+def analyze_orientations(path, threshold_deg=35.0, min_feature_mm=2.0):
+    """Per orientation: overhang that really needs support (connected regions wider than
+    min_feature_mm, sloped), flat ceilings (bridges), bed contact, height."""
+    import numpy as np
+    tri = _read_stl(path)
+    total = None
+    rows = []
+    cos_t = np.cos(np.radians(threshold_deg))
+    for label, rx, ry in ORIENTATIONS:
+        t = tri @ _rot(rx, ry).T
+        cr = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
+        area2 = np.linalg.norm(cr, axis=1)
+        ok = area2 > 1e-12
+        nz = np.zeros(len(t))
+        nz[ok] = cr[ok, 2] / area2[ok]
+        area = area2 / 2
+        if total is None:
+            total = float(area.sum())
+        zmin = t[:, :, 2].min()
+        on_bed = t[:, :, 2].max(axis=1) < zmin + 0.3
+        down = (nz < -cos_t) & ~on_bed
+        sloped = 0.0
+        flat = 0.0
+        biggest = 0.0
+        for reg in _regions(t, down):
+            pts = t[reg].reshape(-1, 3)
+            span = float(max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1])))
+            depth = float((area[reg] * -nz[reg]).sum()) / max(span, 1e-6)  # how far it sticks out
+            if span < min_feature_mm or depth < min_feature_mm / 2:
+                continue  # tiny or shallow lip (stone undersides, texture): prints fine
+            a_reg = float(area[reg].sum())
+            a_flat = float(area[reg][nz[reg] < -0.985].sum())
+            flat += a_flat
+            sloped += a_reg - a_flat
+            biggest = max(biggest, span)
+        contact = (nz < -0.985) & (t[:, :, 2].max(axis=1) < zmin + 0.05)
+        ext = t.reshape(-1, 3).max(0) - t.reshape(-1, 3).min(0)
+        rows.append({"orientation": label, "rotate_x": rx, "rotate_y": ry,
+                     "overhang_mm2": round(sloped + flat, 1),
+                     "sloped_overhang_mm2": round(sloped, 1),
+                     "flat_ceiling_mm2": round(flat, 1),
+                     "largest_overhang_mm": round(biggest, 1),
+                     "bed_contact_mm2": round(float(area[contact].sum()), 1),
+                     "height_mm": round(float(ext[2]), 1),
+                     "footprint_mm": [round(float(ext[0]), 1), round(float(ext[1]), 1)]})
+    best = min(rows, key=lambda r: (r["overhang_mm2"], -r["bed_contact_mm2"], r["height_mm"]))
+    stable = max(rows, key=lambda r: (r["bed_contact_mm2"], -r["overhang_mm2"]))
+    return {"threshold_deg": threshold_deg, "ignored_details_below_mm": min_feature_mm,
+            "surface_mm2": round(total or 0, 1), "orientations": rows,
+            "least_support": best["orientation"], "most_stable": stable["orientation"],
+            "note": "flat_ceiling = horizontal undersides; short ones print as bridges without support."}
+
+
+def _process_threshold(name):
+    try:
+        v = presets()["process"].get(name, {}).get("support_threshold_angle")
+        return float(v) if v not in (None, "", "0") else None
+    except Exception:
+        return None
+
+
+def _layer_of(name):
+    m = re.match(r"\s*(\d+\.\d+)\s*mm", name or "")
+    return float(m.group(1)) if m else None
+
+
+def _profile_tip(printer, process, height, footprint):
+    """Suggest another of the USER's own compatible processes when size and layer height clash."""
+    allp = presets()
+    md = allp["machine"].get(printer, {})
+    mine = [n for n in allp["process"] if compatible(allp["process"][n], printer, md)]
+    lh = _layer_of(process)
+    size = max([height or 0] + list(footprint or []))
+    if not lh or not size:
+        return None
+    if size < 40 and lh >= 0.2:
+        finer = sorted((n for n in mine if (_layer_of(n) or 1) < lh), key=lambda n: -(_layer_of(n) or 0))
+        pick = next((n for n in finer if re.search(r"fine|detail|smooth|organic|organico", n, re.I)), finer[0] if finer else None)
+        if pick:
+            return f"Small part ({size:.0f} mm) at {lh} mm layers: '{pick}' would show more detail (slower)."
+    if size > 120 and lh <= 0.16:
+        coarser = sorted((n for n in mine if (_layer_of(n) or 0) > lh), key=lambda n: _layer_of(n) or 0)
+        if coarser:
+            return f"Large part ({size:.0f} mm) at {lh} mm layers: '{coarser[0]}' would be much faster."
+    return None
+
+
 # ------------------------------------------------------------------ MCP server
-mcp = FastMCP("orca", instructions=(
-    "Slices 3D models with the user's own OrcaSlicer and user presets. Presets can be named by "
-    "fragments ('0.20 balanced', '0.6', 'petg'). Grams and hours are OrcaSlicer's estimate. "
-    "Paths are local paths on the user's computer."))
+GUIDE = """Slicing with OrcaMCP. Only ever offer the user's OWN presets (from list_printers /
+list_profiles), never factory presets they don't have.
+
+GUIDED mode (default when the user asks to slice and did not give the details):
+ask one question at a time, with options, and mark the recommended/current one:
+ 1. Printer: options from list_printers (mark the active one). Skip if only one printer or already said.
+ 2. Filament/material: options from list_profiles(printer=...) filaments (only compatible ones).
+ 3. Process: options from list_profiles(printer=...) processes (compatible only); recommend one by
+    part size (small/detailed -> finer layer, big -> thicker layer).
+ 4. Orientation: run analyze_model first and offer: "as is", the least-support orientation,
+    the most stable one (largest bed contact; prefer it for ASA/ABS), or "let OrcaSlicer orient".
+ Then call slice_advice with the choices and present: grams, time, and the advice with the
+ alternatives it measured (e.g. without supports, rotated), so the user can pick.
+QUICK mode (user says "just slice it", batch jobs, or repeats a known setup): use the active
+printer and its defaults, call slice (or slice_folder) directly, and give advice only if notable.
+Remember the user's choices in the conversation; use set_printer when they switch printers.
+Grams and hours are OrcaSlicer estimates. Paths are local paths on the user's computer."""
+
+mcp = FastMCP("orca", instructions=GUIDE)
 
 
 @mcp.tool()
@@ -501,6 +725,125 @@ def compare_printers(files: list[str], printers: list[str] | None = None, proces
     return out
 
 
+@mcp.tool()
+def slicing_guide() -> str:
+    """How to run a guided slicing session (questions to ask, in order). Read before slicing."""
+    return GUIDE
+
+
+@mcp.tool()
+def analyze_model(file: str, material: str = "", process: str = "") -> dict:
+    """Orientation analysis of an STL without slicing: for 6 orientations, overhang area that needs
+    support, bed contact area and height. Material (PLA, PETG, ASA, ABS, TPU) or the process's own
+    support threshold sets the overhang angle. Returns least_support and most_stable orientations
+    (use their rotate_x / rotate_y with slice or slice_advice)."""
+    mat = _material_of(material)
+    thr = (_process_threshold(find("process", process, presets())) if process else None) or MATERIAL.get(mat, {}).get("overhang", 40)
+    out = analyze_orientations(file, thr)
+    out["material"] = mat
+    out["material_notes"] = MATERIAL.get(mat, {}).get("notes", [])
+    return out
+
+
+@mcp.tool()
+def slice_advice(files: list[str], printer: str = "", process: str = "", filament: str = "",
+                 rotate_x: float = 0, rotate_y: float = 0, auto_orient: bool = False,
+                 try_alternatives: bool = True) -> dict:
+    """Slice with the chosen options AND measure alternatives worth considering, then advise:
+    without supports (if the profile uses them), the least-support orientation (if different),
+    a better-suited process among the user's own, and material tips. Returns the chosen result,
+    the measured alternatives and a list of advice lines."""
+    base = slice_files(files, printer or None, process or None, filament or None,
+                       auto_orient=auto_orient, rotate_x=rotate_x, rotate_y=rotate_y)
+    m, p, f = base["printer"], base["process"], base["filament"]
+    mat = _material_of(f, base.get("material", ""))
+    thr = _process_threshold(p) or MATERIAL.get(mat, {}).get("overhang", 40)
+    advice, alts = [], []
+
+    def delta(r):
+        return {"grams_saved": round(base["grams"] - r["grams"], 1),
+                "minutes_saved": round((base["hours"] - r["hours"]) * 60)}
+
+    geo = None
+    if len(files) == 1 and files[0].lower().endswith(".stl"):
+        try:
+            geo = analyze_orientations(files[0], thr)
+        except Exception:
+            geo = None
+    cur = None
+    if geo and not auto_orient:
+        cur = next((o for o in geo["orientations"] if o["rotate_x"] == (rotate_x % 360) and o["rotate_y"] == (rotate_y % 360)), None)
+
+    if try_alternatives and base.get("supports"):
+        r = slice_files(files, m, p, f, auto_orient=auto_orient, rotate_x=rotate_x, rotate_y=rotate_y, supports="off")
+        alt = {"option": "same, without supports", "grams": r["grams"], "time": r["time"], **delta(r)}
+        if alt["grams_saved"] < 0.5 and alt["minutes_saved"] < 3:
+            pass  # the profile has supports on but none are generated: nothing to say
+        else:
+            alts.append(alt)
+            gain = f"{alt['grams_saved']} g and {alt['minutes_saved']} min"
+            if cur is not None:
+                alt["sloped_overhang_mm2"] = cur["sloped_overhang_mm2"]
+                alt["flat_ceiling_mm2"] = cur["flat_ceiling_mm2"]
+                alt["largest_overhang_mm"] = cur["largest_overhang_mm"]
+                if cur["sloped_overhang_mm2"] < 25 and cur["largest_overhang_mm"] < 10:
+                    advice.append(f"Supports look unnecessary: no real overhang steeper than {thr:g} deg "
+                                  f"(flat undersides {cur['flat_ceiling_mm2']} mm2 print as short bridges). "
+                                  f"Without supports you save {gain}.")
+                elif cur["largest_overhang_mm"] < (10 if mat in ("PLA", "ASA", "ABS") else 6):
+                    advice.append(f"Without supports you save {gain}. The overhangs are many small ones "
+                                  f"({cur['sloped_overhang_mm2']} mm2 in total, none wider than {cur['largest_overhang_mm']} mm): "
+                                  f"in {mat} these usually print acceptably without supports, with rougher undersides. "
+                                  "Worth trying without supports, or with supports on the build plate only.")
+                elif cur["sloped_overhang_mm2"] < 150:
+                    advice.append(f"Without supports you save {gain}. There are {cur['sloped_overhang_mm2']} mm2 of "
+                                  f"overhang beyond {thr:g} deg (largest {cur['largest_overhang_mm']} mm): usually "
+                                  "acceptable on hidden or rough faces; try one print or use support painting/blockers.")
+                else:
+                    advice.append(f"Keep supports: {cur['sloped_overhang_mm2']} mm2 of overhang beyond {thr:g} deg "
+                                  f"(largest {cur['largest_overhang_mm']} mm). Without them you would save {gain} "
+                                  "but those faces would print in the air.")
+            else:
+                advice.append(f"Without supports: {gain} less (check the overhangs before printing).")
+
+    if try_alternatives and geo and cur is not None:
+        best = next(o for o in geo["orientations"] if o["orientation"] == geo["least_support"])
+        if best is not cur and best["overhang_mm2"] < 0.7 * cur["overhang_mm2"]:
+            r = slice_files(files, m, p, f, rotate_x=best["rotate_x"], rotate_y=best["rotate_y"])
+            alt = {"option": f"rotated {best['orientation']} (rotate_x={best['rotate_x']}, rotate_y={best['rotate_y']})",
+                   "grams": r["grams"], "time": r["time"], **delta(r),
+                   "overhang_mm2": best["overhang_mm2"], "height_mm": best["height_mm"]}
+            alts.append(alt)
+            advice.append(f"Orientation {best['orientation']}: overhang {cur['overhang_mm2']} -> {best['overhang_mm2']} mm2, "
+                          f"{alt['grams_saved']} g and {alt['minutes_saved']} min saved. Check that the visible faces still look good.")
+        if mat in ("ASA", "ABS"):
+            st = next(o for o in geo["orientations"] if o["orientation"] == geo["most_stable"])
+            if st is not cur and st["bed_contact_mm2"] > 1.5 * max(cur["bed_contact_mm2"], 1):
+                advice.append(f"{mat}: orientation {st['orientation']} has {st['bed_contact_mm2']} mm2 on the bed "
+                              f"(now {cur['bed_contact_mm2']}): less warping.")
+
+    if try_alternatives and not auto_orient:
+        try:
+            r = slice_files(files, m, p, f, auto_orient=True)
+            d = delta(r)
+            if d["grams_saved"] >= 1 or d["minutes_saved"] >= 5:
+                alts.append({"option": "let OrcaSlicer orient it (auto_orient=true)", "grams": r["grams"],
+                             "time": r["time"], **d, "height_mm": r.get("height_mm")})
+                advice.append(f"OrcaSlicer's own orientation saves {d['grams_saved']} g and {d['minutes_saved']} min "
+                              "(it ignores looks: check which faces end up on the bed or on supports).")
+        except Exception:
+            pass
+
+    tip = _profile_tip(m, p, cur["height_mm"] if cur else base.get("height_mm"), cur["footprint_mm"] if cur else None)
+    if tip:
+        advice.append(tip)
+    advice += MATERIAL.get(mat, {}).get("notes", [])
+    if not advice:
+        advice.append("The chosen setup looks right: no cheaper alternative found.")
+    return {"result": base, "material": mat, "overhang_threshold_deg": thr,
+            "alternatives": alts, "advice": advice}
+
+
 @mcp.tool(name="model_info")
 def model_info_tool(path: str) -> dict:
     """Size (mm), volume, facet count and whether the mesh is closed, without slicing."""
@@ -510,14 +853,18 @@ def model_info_tool(path: str) -> dict:
 
 @mcp.tool()
 def slice(files: list[str], printer: str = "", process: str = "", filament: str = "",
-          copies: int = 1, auto_orient: bool = False, save_to: str = "", name: str = "") -> dict:
+          copies: int = 1, auto_orient: bool = False, rotate_x: float = 0, rotate_y: float = 0,
+          rotate_z: float = 0, supports: str = "profile", save_to: str = "", name: str = "") -> dict:
     """Slice one or more STL/3MF/STEP files together on one plate with the user's presets.
     Returns grams, hours and the presets used. Empty preset = printer default.
     copies: clone each model N times on the plate (per-copy grams/hours included).
     auto_orient: let OrcaSlicer orient the parts (default keeps the file orientation).
+    rotate_x / rotate_y / rotate_z: degrees (e.g. from analyze_model).
+    supports: 'profile' (as the process says), 'off' or 'on' (only for this slice; presets untouched).
     save_to: folder to save the .gcode and .gcode.3mf (empty = save nothing; never overwrites)."""
     return slice_files(files, printer or None, process or None, filament or None,
-                       save_to or None, name or None, copies, auto_orient)
+                       save_to or None, name or None, copies, auto_orient,
+                       rotate_x, rotate_y, rotate_z, supports)
 
 
 @mcp.tool()
