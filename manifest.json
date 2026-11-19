@@ -1,0 +1,103 @@
+{
+  "manifest_version": "0.4",
+  "name": "orcamcp",
+  "display_name": "Orca MCP",
+  "version": "1.1.0",
+  "description": "Slice with your own OrcaSlicer and user presets, on any of your printers: grams, print time, G-code, batch slicing and printer comparison.",
+  "long_description": "Uses the OrcaSlicer CLI with your own user presets (including presets that inherit from system ones, which the CLI cannot resolve on its own in OrcaSlicer 2.5). Works on a private copy of your presets; never writes to your OrcaSlicer folder and never overwrites files.",
+  "author": {
+    "name": "Ricardo Lugaresi",
+    "url": "https://github.com/rexcacayo"
+  },
+  "server": {
+    "type": "uv",
+    "entry_point": "src/orca_mcp.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "${__dirname}",
+        "src/orca_mcp.py"
+      ],
+      "env": {
+        "ORCA_MCP_ORCA_EXE": "${user_config.orca_exe}",
+        "ORCA_MCP_ORCA_DATA": "${user_config.orca_data}",
+        "ORCA_MCP_DEFAULT_PRINTER": "${user_config.default_printer}",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "list_printers",
+      "description": "Your printers, nozzles and which one is active"
+    },
+    {
+      "name": "set_printer",
+      "description": "Choose the active printer (remembered)"
+    },
+    {
+      "name": "list_profiles",
+      "description": "Your printer, process and filament presets (optionally only those compatible with a printer)"
+    },
+    {
+      "name": "model_info",
+      "description": "Size, volume and mesh check without slicing"
+    },
+    {
+      "name": "slice",
+      "description": "Slice models with your presets: grams, time, optional G-code/3MF"
+    },
+    {
+      "name": "slice_folder",
+      "description": "Slice every model in a folder and write a CSV"
+    },
+    {
+      "name": "compare_printers",
+      "description": "Slice the same model on several printers and compare"
+    }
+  ],
+  "user_config": {
+    "orca_exe": {
+      "type": "file",
+      "title": "OrcaSlicer executable",
+      "description": "Leave empty to auto-detect.",
+      "required": false
+    },
+    "orca_data": {
+      "type": "directory",
+      "title": "OrcaSlicer data folder",
+      "description": "Leave empty to auto-detect (%APPDATA%\\OrcaSlicer, ~/Library/Application Support/OrcaSlicer).",
+      "required": false
+    },
+    "default_printer": {
+      "type": "string",
+      "title": "Default printer preset",
+      "description": "Name or part of it, e.g. 'AD5M Pro 0.4'. Empty = simplest user printer. You can change the active printer anytime by asking Claude (set_printer).",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "win32",
+      "darwin",
+      "linux"
+    ],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  },
+  "keywords": [
+    "orcaslicer",
+    "3d-printing",
+    "slicer",
+    "gcode"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rexcacayo/orcamcp"
+  },
+  "homepage": "https://github.com/rexcacayo/orcamcp"
+}
